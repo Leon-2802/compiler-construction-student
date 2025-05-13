@@ -1,0 +1,31 @@
+%import common.NEWLINE
+%import common.WS_INLINE
+%import common.SH_COMMENT
+%import common.CNAME
+%import common.INT
+%ignore WS_INLINE
+%ignore SH_COMMENT
+
+arg_list:  | exp ("," exp)*
+
+exp_2: CNAME           -> cname_exp
+     | INT             -> int_exp
+     | "(" exp ")"     -> paren_exp
+     | CNAME "("arg_list")"  -> call_exp
+     | "-" exp_2        -> usub_exp
+
+exp_1: exp_1 "*" exp_2 -> mul_exp
+     | exp_2           -> exp_2
+
+exp: exp "+" exp_1    -> add_exp
+    | exp "-" exp_1   -> sub_exp
+    | exp_1           -> exp_1 
+
+assign: CNAME "=" exp -> assign
+
+stmt: exp -> stmt_exp
+        | assign -> stmt_assign
+
+stmt_list: NEWLINE* (stmt NEWLINE+)* -> stmt_list
+
+mod: stmt_list
