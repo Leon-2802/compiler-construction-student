@@ -133,8 +133,12 @@ def mkParser(alg: ParseAlg, grammarFile: str, start: str) -> Lark:
                             lexer='basic', debug=True)
             case 'lalr':
                 return Lark(grammar, start=start, parser='lalr', strict=True,
-                            debug=True, lexer='basic')
+                            debug=False, lexer='basic')
     except exceptions.LarkError as err:
+        if alg == 'lalr':
+            # lark does not output details about conflicts if running with strict=True.
+            # Thus, we rerun with strict=False.
+            Lark(grammar, start=start, parser='lalr', strict=False, debug=True, lexer='basic')
         raise ParseError(f'Error constructing {alg} parser from grammar in {grammarFile}: {err}')
 
 def _parseAsParseTree(parser: Lark, s: str, png: Optional[str]) -> ParseTree:
