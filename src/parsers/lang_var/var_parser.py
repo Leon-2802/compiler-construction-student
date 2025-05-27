@@ -19,7 +19,7 @@ def parseTreeToModuleAst(t: ParseTree) -> mod:
     match t.data:
         case "mod":
             module = Module(parseTreeToStmtListAst(asTree(t.children[0])))
-        case _: raise ValueError("parsetree not of type lvar")
+        case _: raise ValueError("parsetree not of type mod")
     return module
 
 def parseTreeToStmtListAst(t: ParseTree) -> list[stmt]:
