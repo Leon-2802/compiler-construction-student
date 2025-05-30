@@ -8,7 +8,7 @@ from common.compilerSupport import *
 # import common.utils as utils
 
 
-max_len: int = 6553600 # hard-coded maximum array size (#TODO: make this configurable)
+cfg_global: CompilerConfig;
 
 def compileModule(m: plainAst.mod, cfg: CompilerConfig) -> WasmModule:
     """
@@ -16,6 +16,8 @@ def compileModule(m: plainAst.mod, cfg: CompilerConfig) -> WasmModule:
     """
     vars = array_tychecker.tycheckModule(m)
     ctx = array_transform.Ctx()
+    global cfg_global
+    cfg_global = cfg
     stmtsAtom = array_transform.transStmts(m.stmts, ctx)
     instrs = compileStmts(stmtsAtom)
     idMain = WasmId('$main')
@@ -69,15 +71,32 @@ def compileExp(exp: exp) -> list[WasmInstr]:
             wasmInstructs.extend(compileAtomExp(e))
         case Call(name, args):
             #TODO call in relation to array? See Typing Rules -> Expressions for Larray
-            wasmInstructs.extend(compileCall(name, args))
+            if name.name == "len": # len is compiled seperately, as it is not a default Wasm function
+                for arg in args:
+                    wasmInstructs.extend(compileExp(arg))
+                wasmInstructs.extend(arrayLenInstrs())  # Get length of array
+            else:
+                wasmInstructs.extend(compileCall(name, args))
         case UnOp(op, arg):
             wasmInstructs.extend(compileUnaryOp(op, arg))
         case BinOp(left, op, right):
             wasmInstructs.extend(compileBinaryOp(left, op, right))
-        case ArrayInitStatic(_elemInit):
+        case ArrayInitStatic(elemInit):
+            elemInitTy: ty = elemInit[0].ty if elemInit[0].ty is not None else Int()  # Default to Int if no type is given
+            # compute the length of the array:
+            itemsCount: int = 0
+            for item in elemInit:
+                if item.ty is not None:
+                    if item.ty != elemInitTy:
+                        raise ValueError(f"All elements in ArrayInitStatic must have the same type, but found {item.ty} and {elemInitTy}")
+                itemsCount += 1
+            len: atomExp = IntConst(itemsCount, elemInitTy)  # Length of the array is the number of elements in elemInit
+            compileInitArray(len, elemInitTy, cfg_global) # Initialize the array -> address of the array is on top of stack
             #TODO set each element individually
             pass
-        case ArrayInitDyn(_len, _elemInit):
+        case ArrayInitDyn(len, elemInit):
+            elemInitTy: ty = elemInit.ty if elemInit.ty is not None else Int()  # Default to Int if no type is given
+            compileInitArray(len, elemInitTy, cfg_global) # Initialize the array -> address of the array is on top of stack
             #TODO set all elements to the same value
             pass
         case Subscript(array, index):
@@ -130,40 +149,64 @@ def compileWhileStmt(cond: exp, body: list[stmt], loop_counter: dict[str, int]) 
 # Array specific: -------------------------------------------------------------------------
 
 def compileInitArray(lenExp: atomExp, elemTy: ty, cfg: CompilerConfig) -> list[WasmInstr]:
-    # Generates code to initialize an array without initializing the elements.
+    """
+    Generates code to initialize an array without initializing the elements.
+    Leaves the address of the array on top of stack.
+    """
     wasmInstructs: list[WasmInstr] = []
-    #TODO logic here
-    # Slide 19-25 for reference
 
-    # length must be between zero and max array size -> construct if-condition:
+    wasmInstructs.extend(compileAtomExp(lenExp)) # compile length expression
+    wasmInstructs.append(WasmInstrConvOp('i64.extend_i32_u')) #TODO convert to i64 may be unnecessary
+    wasmInstructs.append(WasmInstrVarLocal("set", WasmId('$n'))) # store length in local variable $n
+
+
+    # check length: length must be between zero and max array size -> construct if-condition:
     ifCond: list [WasmInstr] = []
-    ifCond.extend(compileAtomExp(lenExp))
+    ifCond.append(WasmInstrVarLocal("get", WasmId('$n'))) # get length of array from local variable $n
     ifCond.append(WasmInstrConst('i32', 0))
     ifCond.append(WasmInstrIntRelOp('i32', 'gt_s')) # -> check > 0
-    # store check for < maxLength seperately...
-    right: list[WasmInstr] = compileAtomExp(lenExp) 
-    right.append(WasmInstrConst('i32', max_len)) #TODO for now hard-coded to global variable -> get max array size: Maximum array size can be specified on the commandline (--max-array-size), default: 50MB
-    right.append(WasmInstrIntRelOp('i32', 'le_s')) # -> check <= 100
+    # store check for <= maxLength seperately...
+    right: list[WasmInstr] = []
+    right.append(WasmInstrVarLocal("get", WasmId('$n'))) # get length of array from local variable $n
+    right.append(WasmInstrConst('i32', cfg.maxArraySize))
+    right.append(WasmInstrIntRelOp('i32', 'le_s')) # -> check <= maxArraySize
     ifCond.append(WasmInstrIf('i32', right, [WasmInstrConst('i32', 0)])) # connect both checks with AND
+    wasmInstructs.extend(ifCond) # put if condition on top of stack
 
     # Add if and else body instructions for error case
     thenInstr: list[WasmInstr] = []
     thenInstr.append(WasmInstrConst('i32', 0))
     thenInstr.append(WasmInstrConst('i32', 14))
     thenInstr.append(WasmInstrCall(WasmId('$print_err')))
-    thenInstr.append(WasmInstrTrap()) # = unreachable
+    thenInstr.append(WasmInstrTrap()) # = unreachable -> stop execution
     elseInstr: list[WasmInstr] = []
     wasmInstructs.append(WasmInstrIf('i32', thenInstr, elseInstr))
     
-    #TODO continue on slide 21...
+    # Compute header: 
     wasmInstructs.append(WasmInstrVarGlobal("get", Globals.freePtr)) # save old value $@free_ptr (address of the array on top of stack)
-    wasmInstructs.extend(arrayLenInstrs()) # puts the length on top of stack
+    wasmInstructs.extend(arrayLenInstrs()) # get length of array
     if isinstance(elemTy, Array):
         m: Literal[3, 1] = 3
     else:
         m: Literal[3, 1] = 1
     wasmInstructs.extend(computeHeader(m)) 
     wasmInstructs.append(WasmInstrMem('i32', 'store')) # store header in memory
+
+    # Move free_ptr and return array address
+    wasmInstructs.append(WasmInstrVarGlobal("get", Globals.freePtr)) # move free_ptr
+    wasmInstructs.extend(arrayLenInstrs()) # get length of array
+    wasmInstructs.append(WasmInstrConvOp('i32.wrap_i64')) # convert to i32
+    if (isinstance(elemTy, Int)):
+        wasmInstructs.append(WasmInstrConst('i32', 8)) # 8 bytes for Int -> i64
+    else:
+        wasmInstructs.append(WasmInstrConst('i32', 4)) # 4 bytes for Bools or Arrays
+    wasmInstructs.append(WasmInstrNumBinOp('i32', 'mul')) # multiply length by size of element type
+    wasmInstructs.append(WasmInstrConst('i32', 4)) # add 4 bytes for header
+    wasmInstructs.append(WasmInstrNumBinOp('i32', 'add')) # add length to free_ptr
+    wasmInstructs.append(WasmInstrVarGlobal("get", Globals.freePtr)) # get address of the array
+    wasmInstructs.append(WasmInstrNumBinOp('i32', 'add')) # add the space required by the array to $@free_ptr
+    wasmInstructs.append(WasmInstrVarGlobal("set", Globals.freePtr)) # save new $@free_pt
+    # -> now the old value of $@free_ptr (the array address) is on top of stack.
 
     return wasmInstructs
 
