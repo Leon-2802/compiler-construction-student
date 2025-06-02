@@ -9,6 +9,7 @@ from common.compilerSupport import *
 
 
 cfg_global: CompilerConfig;
+loop_counter_global: dict[str, int];
 
 def compileModule(m: plainAst.mod, cfg: CompilerConfig) -> WasmModule:
     """
@@ -18,12 +19,16 @@ def compileModule(m: plainAst.mod, cfg: CompilerConfig) -> WasmModule:
     ctx = array_transform.Ctx()
     global cfg_global
     cfg_global = cfg
+    global loop_counter_global 
+    loop_counter_global = {} # initialize storage variable for loop counter
     stmtsAtom = array_transform.transStmts(m.stmts, ctx)
     instrs = compileStmts(stmtsAtom)
     idMain = WasmId('$main')
     locals: list[tuple[WasmId, WasmValtype]] = [(identToWasmId(x), mapVarType(i.ty)) for x,i in vars.items()]
     locals.extend(Locals.decls())
     locals.extend([(identToWasmId(x), mapVarType(i)) for x,i in ctx.freshVars.items()])
+    # Add the declaration for variable $n, which stores the length
+    locals.append((WasmId('$n'), 'i32'))
     return WasmModule(imports=wasmImports(cfg.maxMemSize),
         exports=[WasmExport("main", WasmExportFunc(idMain))],
         globals=Globals.decls(),
@@ -35,14 +40,13 @@ def compileModule(m: plainAst.mod, cfg: CompilerConfig) -> WasmModule:
 
 def compileStmts(stmts: list[stmt]) -> list[WasmInstr]:
     wasmInstructs: list[WasmInstr] = []
-    loop_counter: dict[str, int] = {}
     for s in stmts:
-         a = matchType(s, loop_counter)
+         a = matchType(s)
          wasmInstructs.extend(a)
     return wasmInstructs
         
 
-def matchType(s: stmt, loop_counter: dict[str, int]) -> list[WasmInstr]:
+def matchType(s: stmt) -> list[WasmInstr]:
     wasmInstructs: list[WasmInstr] = []
     match s:
         case StmtExp(e):
@@ -50,7 +54,9 @@ def matchType(s: stmt, loop_counter: dict[str, int]) -> list[WasmInstr]:
         case IfStmt(cond, thenBody, elseBody):
             wasmInstructs.extend(compileIfStmt(cond, thenBody, elseBody))
         case WhileStmt(cond, body):
-            wasmInstructs.extend(compileWhileStmt(cond, body, loop_counter))
+            condInstr: list[WasmInstr] = compileExp(cond)
+            bodyInstr: list[WasmInstr] = compileStmts(body)
+            wasmInstructs.extend(compileWhileStmt(condInstr, bodyInstr))
         case SubscriptAssign(_left, _index, _right):
             #TODO Check that i is not out-of-bounds
             # Compute address of element at index i
@@ -90,15 +96,34 @@ def compileExp(exp: exp) -> list[WasmInstr]:
                     if item.ty != elemInitTy:
                         raise ValueError(f"All elements in ArrayInitStatic must have the same type, but found {item.ty} and {elemInitTy}")
                 itemsCount += 1
-            len: atomExp = IntConst(itemsCount, elemInitTy)  # Length of the array is the number of elements in elemInit
-            compileInitArray(len, elemInitTy, cfg_global) # Initialize the array -> address of the array is on top of stack
+            len: atomExp = IntConst(itemsCount)  # Length of the array is the number of elements in elemInit
+            wasmInstructs.extend(compileInitArray(len, elemInitTy, cfg_global)) # Initialize the array -> address of the array is on top of stack
             #TODO set each element individually
-            pass
         case ArrayInitDyn(len, elemInit):
             elemInitTy: ty = elemInit.ty if elemInit.ty is not None else Int()  # Default to Int if no type is given
-            compileInitArray(len, elemInitTy, cfg_global) # Initialize the array -> address of the array is on top of stack
-            #TODO set all elements to the same value
-            pass
+            wasmInstructs.extend(compileInitArray(len, elemInitTy, cfg_global)) # Initialize the array -> address of the array is on top of stack
+            # set all elements to the same value -> loop to initialize the array elements
+            wasmInstructs.append(WasmInstrVarLocal('tee', Locals.tmp_i32)) # set $@tmp_i32 to array address, leave it on top of stack
+            wasmInstructs.append(WasmInstrVarLocal('get', Locals.tmp_i32))
+            wasmInstructs.append(WasmInstrConst('i32', 4))
+            wasmInstructs.append(WasmInstrNumBinOp('i32', 'add')) 
+            wasmInstructs.append(WasmInstrVarLocal('set', Locals.tmp_i32)) # set $@tmp_i32 to the first array element
+            # set up while loop for initialization:
+            loopCond: list[WasmInstr] = []
+            loopCond.append(WasmInstrVarLocal('get', Locals.tmp_i32))
+            loopCond.append(WasmInstrVarGlobal('get', Globals.freePtr))
+            loopCond.append(WasmInstrIntRelOp('i32', 'lt_u')) # compare against end of array
+            bodyInstr: list[WasmInstr] = []
+            bodyInstr.append(WasmInstrVarLocal('get', Locals.tmp_i32))
+            bodyInstr.extend(compileAtomExp(elemInit)) # compile expression for the initial value
+            bodyInstr.append(WasmInstrMem(mapVarType(elemInitTy), 'store')) # initialize array element
+            bodyInstr.append(WasmInstrVarLocal('get', Locals.tmp_i32))
+            bodyInstr.append(WasmInstrConst('i32', 8 if isinstance(elemInitTy, Int) else 4)) # 4 bytes for Bools or Arrays
+            bodyInstr.append(WasmInstrNumBinOp('i32', 'add')) # add size of array element
+            bodyInstr.append(WasmInstrVarLocal('set', Locals.tmp_i32)) # set $@tmp_i32 to next array element
+            # wrap in while loop:
+            wasmInstructs.extend(compileWhileStmt(loopCond, bodyInstr)) 
+
         case Subscript(array, index):
             #TODO check if index in bounds using arrayLenInstrs()
             # Check that i is not out-of-bounds
@@ -117,18 +142,18 @@ def compileIfStmt(cond: exp, thenBody: list[stmt], elseBody: list[stmt]) -> list
     wasmInstructs.append(WasmInstrIf(None, thenBodyInstr, elseBodyInstr))
     return wasmInstructs
 
-def compileWhileStmt(cond: exp, body: list[stmt], loop_counter: dict[str, int]) -> list[WasmInstr]:
+def compileWhileStmt(cond: list[WasmInstr], body: list[WasmInstr]) -> list[WasmInstr]:
     wasmInstructs: list[WasmInstr] = []
-    loop_start_label: str = generateUniqueLabel('$loop_start', loop_counter)
-    loop_exit_label: str = generateUniqueLabel('$loop_exit', loop_counter)
+    loop_start_label: str = generateUniqueLabel('$loop_start')
+    loop_exit_label: str = generateUniqueLabel('$loop_exit')
     blockBodyInstr: list[WasmInstr] = []
     loopBodyInstr: list[WasmInstr] = []
 
     # Compile the condition
-    loopBodyInstr.extend(compileExp(cond))
+    loopBodyInstr.extend(cond)
 
     # Compile the body of the loop
-    ifBodyInstr: list[WasmInstr] = compileStmts(body)
+    ifBodyInstr: list[WasmInstr] = body
     ifBodyInstr.append(WasmInstrBranch(WasmId(loop_start_label), False))
 
     # Handle the else body (exit the loop)
@@ -155,32 +180,26 @@ def compileInitArray(lenExp: atomExp, elemTy: ty, cfg: CompilerConfig) -> list[W
     """
     wasmInstructs: list[WasmInstr] = []
 
+    elementSize: int = 8 if elemTy == Int() else 4 # store element size
+
+    # store length in local variable $n:
     wasmInstructs.extend(compileAtomExp(lenExp)) # compile length expression
-    wasmInstructs.append(WasmInstrConvOp('i64.extend_i32_u')) #TODO convert to i64 may be unnecessary
+    wasmInstructs.append(WasmInstrConvOp('i32.wrap_i64')) # convert to i32
     wasmInstructs.append(WasmInstrVarLocal("set", WasmId('$n'))) # store length in local variable $n
 
-
-    # check length: length must be between zero and max array size -> construct if-condition:
-    ifCond: list [WasmInstr] = []
-    ifCond.append(WasmInstrVarLocal("get", WasmId('$n'))) # get length of array from local variable $n
-    ifCond.append(WasmInstrConst('i32', 0))
-    ifCond.append(WasmInstrIntRelOp('i32', 'gt_s')) # -> check > 0
-    # store check for <= maxLength seperately...
-    right: list[WasmInstr] = []
-    right.append(WasmInstrVarLocal("get", WasmId('$n'))) # get length of array from local variable $n
-    right.append(WasmInstrConst('i32', cfg.maxArraySize))
-    right.append(WasmInstrIntRelOp('i32', 'le_s')) # -> check <= maxArraySize
-    ifCond.append(WasmInstrIf('i32', right, [WasmInstrConst('i32', 0)])) # connect both checks with AND
-    wasmInstructs.extend(ifCond) # put if condition on top of stack
-
-    # Add if and else body instructions for error case
-    thenInstr: list[WasmInstr] = []
-    thenInstr.append(WasmInstrConst('i32', 0))
-    thenInstr.append(WasmInstrConst('i32', 14))
-    thenInstr.append(WasmInstrCall(WasmId('$print_err')))
-    thenInstr.append(WasmInstrTrap()) # = unreachable -> stop execution
-    elseInstr: list[WasmInstr] = []
-    wasmInstructs.append(WasmInstrIf('i32', thenInstr, elseInstr))
+    # check length: length must be between zero and max array size -> construct if-stmt instructions:
+    # first check < 0:
+    wasmInstructs.append(WasmInstrVarLocal('get', WasmId('$n')))
+    wasmInstructs.append(WasmInstrConst('i32', 0))
+    wasmInstructs.append(WasmInstrIntRelOp('i32', 'lt_s'))
+    wasmInstructs.append(WasmInstrIf('i32', Errors.outputError(Errors.arraySize) + [WasmInstrTrap()], [WasmInstrConst('i32', 1)]))
+    # secondly check for < maxLength ...
+    wasmInstructs.append(WasmInstrVarLocal('get', WasmId('$n')))
+    wasmInstructs.append(WasmInstrConst('i32', elementSize))
+    wasmInstructs.append(WasmInstrNumBinOp('i32', 'mul')) # multiply length by size of element type = size
+    wasmInstructs.append(WasmInstrConst('i32', cfg.maxArraySize))
+    wasmInstructs.append(WasmInstrIntRelOp('i32', 'gt_s'))
+    wasmInstructs.append(WasmInstrIf('i32', Errors.outputError(Errors.arraySize) + [WasmInstrTrap()], [WasmInstrConst('i32', 1)]))
     
     # Compute header: 
     wasmInstructs.append(WasmInstrVarGlobal("get", Globals.freePtr)) # save old value $@free_ptr (address of the array on top of stack)
@@ -196,10 +215,7 @@ def compileInitArray(lenExp: atomExp, elemTy: ty, cfg: CompilerConfig) -> list[W
     wasmInstructs.append(WasmInstrVarGlobal("get", Globals.freePtr)) # move free_ptr
     wasmInstructs.extend(arrayLenInstrs()) # get length of array
     wasmInstructs.append(WasmInstrConvOp('i32.wrap_i64')) # convert to i32
-    if (isinstance(elemTy, Int)):
-        wasmInstructs.append(WasmInstrConst('i32', 8)) # 8 bytes for Int -> i64
-    else:
-        wasmInstructs.append(WasmInstrConst('i32', 4)) # 4 bytes for Bools or Arrays
+    wasmInstructs.append(WasmInstrConst('i32', elementSize))
     wasmInstructs.append(WasmInstrNumBinOp('i32', 'mul')) # multiply length by size of element type
     wasmInstructs.append(WasmInstrConst('i32', 4)) # add 4 bytes for header
     wasmInstructs.append(WasmInstrNumBinOp('i32', 'add')) # add length to free_ptr
@@ -390,8 +406,9 @@ def intIdentToWasmId(x: ident) -> WasmId:
         return WasmId('$' + x.name)   
     
 
-def generateUniqueLabel(prefix: str, counter: dict[str, int]) -> str:
-    if prefix not in counter:
-        counter[prefix] = 0
-    counter[prefix] += 1
-    return f"{prefix}_{counter[prefix]}"     
+def generateUniqueLabel(prefix: str) -> str:
+    global loop_counter_global
+    if prefix not in loop_counter_global:
+        loop_counter_global[prefix] = 0
+    loop_counter_global[prefix] += 1
+    return f"{prefix}_{loop_counter_global[prefix]}"     

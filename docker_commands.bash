@@ -1,3 +1,3 @@
 # access running docker container in terminal:
-docker exec -it 7e0574e407ef9caba392563b557d89ec215ed5662cd98388f895904c5c91ce9b /bin/bash
+docker exec -it 4d16456dd5888ca0cc4d55ca92bc5b01090d881e2be2539c9cbb8c0566449dca /bin/bash
 root@7e0574e407ef:/cc# scripts/run
