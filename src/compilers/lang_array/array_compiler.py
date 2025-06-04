@@ -62,7 +62,7 @@ def matchType(s: stmt) -> list[WasmInstr]:
             # store result at index:
             match left.ty:
                 case Array(elemTy): 
-                    if asTy(elemTy) == Int():
+                    if isinstance(elemTy, Int):
                         wasmInstructs.append(WasmInstrMem("i64","store")) 
                     else:
                         wasmInstructs.append(WasmInstrMem("i32","store"))
@@ -88,8 +88,8 @@ def compileExp(exp: exp) -> list[WasmInstr]:
         case BinOp(left, op, right):
             wasmInstructs.extend(compileBinaryOp(left, op, right))
         case ArrayInitStatic(elemInit):
-            elemInitTy: ty = elemInit[0].ty if elemInit[0].ty is not None else Int()  # Default to Int if no type is given
-            wasmInstructs.extend(compileInitArray(IntConst(len(elemInit)), elemInitTy, cfg_global)) # Initialize the array -> address of the array is on top of stack
+            wasmInstructs.extend(compileInitArray(IntConst(len(elemInit)), asTy(elemInit[0].ty), cfg_global)) # Initialize the array -> address of the array is on top of stack
+            dType: WasmValtype = "i64" if asTy(elemInit[0].ty) == Int() else "i32"
             # set each element individually:
             elemsize: int = 8 if asTy(elemInit[0].ty) == Int() else 4
             for index, elem in enumerate(elemInit): # loop over values that should be used for assignement
@@ -99,11 +99,11 @@ def compileExp(exp: exp) -> list[WasmInstr]:
                 wasmInstructs.append(WasmInstrConst('i32', offset)) 
                 wasmInstructs.append(WasmInstrNumBinOp('i32', 'add')) # move by offset at given index
                 wasmInstructs.extend(compileAtomExp(elem)) # compile value of elem
-                wasmInstructs.append(WasmInstrMem(mapVarType(elemInitTy), 'store')) # initialize element at given index with value of elem -> address of current index on top of stack
+                wasmInstructs.append(WasmInstrMem(dType, 'store')) # initialize element at given index with value of elem -> address of current index on top of stack
 
         case ArrayInitDyn(length, elemInit):
-            elemInitTy: ty = elemInit.ty if elemInit.ty is not None else Int()  # Default to Int if no type is given
-            wasmInstructs.extend(compileInitArray(length, elemInitTy, cfg_global)) # Initialize the array -> address of the array is on top of stack
+            wasmInstructs.extend(compileInitArray(length, asTy(elemInit.ty), cfg_global)) # Initialize the array -> address of the array is on top of stack
+            dType: WasmValtype = "i64" if asTy(elemInit.ty) == Int() else "i32"
             # set all elements to the same value -> loop to initialize the array elements
             wasmInstructs.append(WasmInstrVarLocal('tee', Locals.tmp_i32)) # set $@tmp_i32 to array address, leave it on top of stack
             wasmInstructs.append(WasmInstrVarLocal('get', Locals.tmp_i32))
@@ -118,9 +118,9 @@ def compileExp(exp: exp) -> list[WasmInstr]:
             bodyInstr: list[WasmInstr] = []
             bodyInstr.append(WasmInstrVarLocal('get', Locals.tmp_i32))
             bodyInstr.extend(compileAtomExp(elemInit)) # compile expression for the initial value
-            bodyInstr.append(WasmInstrMem(mapVarType(elemInitTy), 'store')) # initialize array element
+            bodyInstr.append(WasmInstrMem(dType, 'store')) # initialize array element
             bodyInstr.append(WasmInstrVarLocal('get', Locals.tmp_i32))
-            bodyInstr.append(WasmInstrConst('i32', 8 if isinstance(elemInitTy, Int) else 4)) # 4 bytes for Bools or Arrays
+            bodyInstr.append(WasmInstrConst('i32', 8 if isinstance(asTy(elemInit.ty), Int) else 4)) # 4 bytes for Bools or Arrays
             bodyInstr.append(WasmInstrNumBinOp('i32', 'add')) # add size of array element
             bodyInstr.append(WasmInstrVarLocal('set', Locals.tmp_i32)) # set $@tmp_i32 to next array element
             # wrap in while loop:
@@ -133,7 +133,7 @@ def compileExp(exp: exp) -> list[WasmInstr]:
             # Read from memory:
             match array.ty:
                 case Array(elemTy): 
-                    if asTy(elemTy) == Int():
+                    if isinstance(elemTy, Int):
                         wasmInstructs.append(WasmInstrMem("i64","load"))
                     else:
                         wasmInstructs.append(WasmInstrMem("i32","load"))
@@ -191,19 +191,14 @@ def compileInitArray(lenExp: atomExp, elemTy: ty, cfg: CompilerConfig) -> list[W
 
     elementSize: int = 8 if elemTy == Int() else 4 # store element size
 
-    # store length in local variable $n:
-    wasmInstructs.extend(compileAtomExp(lenExp)) # compile length expression
-    wasmInstructs.append(WasmInstrConvOp('i32.wrap_i64')) # convert to i32
-    wasmInstructs.append(WasmInstrVarLocal("set", WasmId('$n'))) # store length in local variable $n
-
-    # check length: length must be between zero and max array size -> construct if-stmt instructions:
+    # check size: size must be between zero and max array size -> construct if-stmt instructions:
     # first check < 0:
-    wasmInstructs.append(WasmInstrVarLocal('get', WasmId('$n')))
+    wasmInstructs.extend(compileLenOfArray(lenExp))
     wasmInstructs.append(WasmInstrConst('i32', 0))
     wasmInstructs.append(WasmInstrIntRelOp('i32', 'lt_s'))
     wasmInstructs.append(WasmInstrIf('i32', Errors.outputError(Errors.arraySize) + [WasmInstrTrap()], [WasmInstrConst('i32', 1)]))
     # secondly check for < maxLength ...
-    wasmInstructs.append(WasmInstrVarLocal('get', WasmId('$n')))
+    wasmInstructs.extend(compileLenOfArray(lenExp))
     wasmInstructs.append(WasmInstrConst('i32', elementSize))
     wasmInstructs.append(WasmInstrNumBinOp('i32', 'mul')) # multiply length by size of element type = size
     wasmInstructs.append(WasmInstrConst('i32', cfg.maxArraySize))
@@ -212,18 +207,17 @@ def compileInitArray(lenExp: atomExp, elemTy: ty, cfg: CompilerConfig) -> list[W
     
     # Compute header: 
     wasmInstructs.append(WasmInstrVarGlobal("get", Globals.freePtr)) # save old value $@free_ptr (address of the array on top of stack)
-    wasmInstructs.extend(arrayLenInstrs()) # get length of array
+    wasmInstructs.extend(compileLenOfArray(lenExp))
     if isinstance(elemTy, Array):
         m: Literal[3, 1] = 3
     else:
         m: Literal[3, 1] = 1
-    wasmInstructs.extend(computeHeader(m)) 
+    wasmInstructs.extend(computeHeader(m, False)) 
     wasmInstructs.append(WasmInstrMem('i32', 'store')) # store header in memory
 
     # Move free_ptr and return array address
     wasmInstructs.append(WasmInstrVarGlobal("get", Globals.freePtr)) # move free_ptr
-    wasmInstructs.extend(arrayLenInstrs()) # get length of array
-    wasmInstructs.append(WasmInstrConvOp('i32.wrap_i64')) # convert to i32
+    wasmInstructs.extend(compileLenOfArray(lenExp))
     wasmInstructs.append(WasmInstrConst('i32', elementSize))
     wasmInstructs.append(WasmInstrNumBinOp('i32', 'mul')) # multiply length by size of element type
     wasmInstructs.append(WasmInstrConst('i32', 4)) # add 4 bytes for header
@@ -237,7 +231,7 @@ def compileInitArray(lenExp: atomExp, elemTy: ty, cfg: CompilerConfig) -> list[W
 
 def arrayLenInstrs() -> list[WasmInstr]:
     """
-    Generates code that expects the array address on top of stack and puts the length on top of stack
+    Generates code that expects the array address on top of stack and puts the length as an i64 value on top of stack
     """
     wasmInstructs: list[WasmInstr] = []
     wasmInstructs.append(WasmInstrMem('i32', 'load')) # load array header
@@ -282,9 +276,6 @@ def arrayOffsetInstrs(arrayExp: atomExp, indexExp: atomExp) -> list[WasmInstr]:
     wasmInstructs.append(WasmInstrNumBinOp('i32', 'add')) # now on top of stack: offset of element
     # -------------------
     wasmInstructs.append(WasmInstrNumBinOp('i32', 'add')) # now on top of stack: address of element
-
-
-    #TODO logic here
 
     return wasmInstructs
 
@@ -402,13 +393,12 @@ def compileBinaryOp(left: exp, op: binaryop, right: exp) -> list[WasmInstr]:
                 wasmInstructs.extend(compileExp(right))
                 wasmInstructs.append(WasmInstrIntRelOp(mapVarType(tyOfExp(left)), 'ne')) 
         case Is():
-            #TODO implement logic
             # check if one array is same -> meaning same address
-            pass
+            wasmInstructs.append(WasmInstrIntRelOp('i32', 'eq'))
     return wasmInstructs
 
 
-def computeHeader(M: int) -> list[WasmInstr]:
+def computeHeader(M: int, convertToi32: bool) -> list[WasmInstr]:
     """
     Computes the header for an array in WebAssembly.
     Assumes length is on top of stack.
@@ -416,15 +406,21 @@ def computeHeader(M: int) -> list[WasmInstr]:
     Length | Kind | Pointer | GC enabled
     """
     wasmInstructs: list[WasmInstr] = []
-    wasmInstructs.append(WasmInstrConvOp('i32.wrap_i64'))
+    if convertToi32 == True:
+        wasmInstructs.append(WasmInstrConvOp('i32.wrap_i64'))
     wasmInstructs.append(WasmInstrConst('i32', 4))
     wasmInstructs.append(WasmInstrNumBinOp('i32', 'shl'))  # shift left by 4 bits
     wasmInstructs.append(WasmInstrConst('i32', M))  # kind
     wasmInstructs.append(WasmInstrNumBinOp('i32', 'xor'))  # combine length and kind
     return wasmInstructs
 
-def computeSizeOfArray() -> list[WasmInstr]:
-    
+def compileLenOfArray(lenExp: atomExp) -> list[WasmInstr]:
+    """
+    Compiles an atomic expression containing the length of an array to wasm, including a conversion from i64 to i32
+    """
+    wasmInstructs: list[WasmInstr] = compileAtomExp(lenExp)
+    wasmInstructs.append(WasmInstrConvOp('i32.wrap_i64'))
+    return wasmInstructs
 
 
 
@@ -434,6 +430,8 @@ def mapVarType(var_type: ty) -> Literal['i64', 'i32']:
     """
     if isinstance(var_type, Int):
         return 'i64'
+    elif isinstance(var_type, Array):
+        return mapVarType(var_type.elemTy)
     else:
         return 'i32'
     
@@ -449,25 +447,7 @@ def tyOfExp(e: exp) -> ty:
         
  
 def identToWasmId(x: ident) -> WasmId:
-    return WasmId('$' + x.name)
-
-
-def boolIdentToWasmId(x: ident) -> WasmId:
-    if x.name == "print":
-        return WasmId('$print_bool')
-    elif x.name == "input_int":
-        return WasmId('$input_i32')
-    else:
-        return WasmId('$' + x.name)
-    
-    
-def intIdentToWasmId(x: ident) -> WasmId:
-    if x.name == "print":
-        return WasmId('$print_i64')
-    elif x.name == "input_int":
-        return WasmId('$input_i64')
-    else:
-        return WasmId('$' + x.name)   
+    return WasmId('$' + x.name)  
     
 
 def generateUniqueLabel(prefix: str) -> str:
